@@ -1,4 +1,4 @@
-**Cerebras challenge fork — pinned SHA: `de7b0b3f08c617f48a00ef09f7169dc74212a6d9`**
+**Cerebras challenge fork — pinned SHA: `3f106830db7657ab25895c3b8fdba8ac2a5041eb`**
 
 <p align="center">
     <br>
