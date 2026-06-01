@@ -1,3 +1,5 @@
+**Cerebras challenge fork — pinned SHA: `de7b0b3f08c617f48a00ef09f7169dc74212a6d9`**
+
 <p align="center">
     <br>
     <img src="docs/en/_static/images/evalscope_logo.png"/>
