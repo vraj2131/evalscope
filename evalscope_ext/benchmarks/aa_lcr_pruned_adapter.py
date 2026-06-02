@@ -2,29 +2,23 @@
 """
 AA-LCR — Discriminative-Diversity Pruned variant.
 
-Registers the benchmark name ``aa_lcr_pruned`` into evalscope's
-BENCHMARK_REGISTRY.  Extends :class:`AALCRAdapter` with the same
-discriminative-diversity pruner as the LCB variant, with one additional
-parameter: ``judge_noise_margin``.
+Registers ``aa_lcr_pruned`` into evalscope's BENCHMARK_REGISTRY.
+Pruning logic lives in :class:`PrunedAdapterMixin`; this file contains only
+the benchmark-specific configuration plus the ``judge_noise_margin`` guard
+that is unique to LLM-judged benchmarks.
 
 AA-LCR is graded by an LLM judge, which is non-deterministic.  A score of
 0 or 1 may reflect judge variance rather than true model capability.  We
-handle this as follows:
+handle this with ``judge_noise_margin``:
 
 * **Observable** variance: cross-model score spread on a single sample.
-  If model A scores 1 and model B scores 0, that spread is real signal
-  (the models genuinely differ) — we want such samples.
-* **Latent** judge noise: the same model on the same sample might score 0
-  on one judge run and 1 on another.  Without repeated runs we cannot
-  measure this directly.
-* **Guard**: ``judge_noise_margin`` (default 0.0) suppresses samples where
-  the cross-model spread is below the margin.  With binary 0/1 scores, any
-  spread ≥ 0.0 passes (spread is either 0 or 1).  Raising the margin (e.g.
-  to 0.5) would exclude all samples where models fully agree — effectively
-  requiring *unanimous disagreement* as evidence the sample is truly
-  discriminative rather than just caught a judge flip.  The default of 0.0
-  is conservative and correct for binary data; it avoids discarding valid
-  discriminative samples on the assumption of noise.
+  If model A scores 1 and model B scores 0, that spread is real signal — we
+  want such samples.
+* **Guard**: ``judge_noise_margin`` (default 0.0) suppresses samples whose
+  cross-model spread is below the margin.  With binary 0/1 scores any spread
+  ≥ 0.0 passes; raising the margin to 0.5 would require unanimous disagreement
+  as evidence the sample is truly discriminative.  The default is correct for
+  binary data and avoids discarding valid discriminative samples.
 
 Usage with evalscope CLI (after ``import evalscope_ext``):
 
@@ -44,31 +38,15 @@ Usage with evalscope CLI (after ``import evalscope_ext``):
 """
 from __future__ import annotations
 
-from typing import Optional
-
 from evalscope.api.benchmark import BenchmarkMeta
-from evalscope.api.dataset import DatasetDict, MemoryDataset
 from evalscope.api.registry import register_benchmark
 from evalscope.benchmarks.aa_lcr.aa_lcr_adapter import (
     AALCRAdapter,
-    JUDGE_PROMPT,
     PROMPT_TEMPLATE,
 )
 from evalscope.constants import Tags
-from evalscope.utils.logger import get_logger
 
-from evalscope_ext.pruner import (
-    load_scores_from_reviews,
-    select_pruned_samples,
-    validate_leave_one_out,
-)
-
-logger = get_logger()
-
-# Score key used by the LLM judge
-_SCORE_KEY = "acc"
-# Review file prefix (matches the shipped Evals file names)
-_BENCHMARK_PREFIX = "aa_lcr"
+from evalscope_ext.benchmarks.base_pruned_adapter import PrunedAdapterMixin
 
 
 @register_benchmark(
@@ -139,87 +117,12 @@ _BENCHMARK_PREFIX = "aa_lcr"
         },
     )
 )
-class AALCRPrunedAdapter(AALCRAdapter):
+class AALCRPrunedAdapter(PrunedAdapterMixin, AALCRAdapter):
     """AA-LCR adapter with discriminative-diversity pruning and judge-noise guard."""
+
+    _SCORE_KEY = "acc"
+    _BENCHMARK_PREFIX = "aa_lcr"
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self._pruning_strategy: str = self.extra_params.get(
-            "pruning_strategy", "discriminative_diversity"
-        )
-        self._prune_ratio: float = float(self.extra_params.get("prune_ratio", 0.3))
-        self._scores_dir: Optional[str] = self.extra_params.get("scores_dir")
-        self._n_buckets: int = int(self.extra_params.get("n_buckets", 5))
-        self._judge_noise_margin: float = float(
-            self.extra_params.get("judge_noise_margin", 0.0)
-        )
-        self._min_spearman: float = float(self.extra_params.get("min_spearman", 0.85))
-
-    def load_dataset(self) -> DatasetDict:
-        full_dataset = super().load_dataset()
-
-        if not self._scores_dir:
-            logger.warning(
-                "aa_lcr_pruned: no scores_dir provided — "
-                "returning full benchmark (no pruning)."
-            )
-            return full_dataset
-
-        logger.info(
-            f"aa_lcr_pruned: loading historical scores from {self._scores_dir} "
-            f"(judge_noise_margin={self._judge_noise_margin})"
-        )
-        scores = load_scores_from_reviews(
-            reviews_dir=self._scores_dir,
-            score_key=_SCORE_KEY,
-            benchmark_prefix=_BENCHMARK_PREFIX,
-        )
-
-        selected = select_pruned_samples(
-            scores=scores,
-            prune_ratio=self._prune_ratio,
-            n_buckets=self._n_buckets,
-            judge_noise_margin=self._judge_noise_margin,
-        )
-
-        # Leave-one-model-out validation
-        try:
-            rhos = validate_leave_one_out(
-                scores=scores,
-                selected_indices=selected,
-                min_spearman=self._min_spearman,
-            )
-            for model, rho in sorted(rhos.items()):
-                logger.info(f"  LOO Spearman ({model} held out): {rho:.3f}")
-        except ValueError as exc:
-            logger.warning(f"aa_lcr_pruned: {exc}")
-
-        selected_set = set(selected)
-        n_full = sum(len(list(ds)) for ds in full_dataset.values())
-        logger.info(
-            f"aa_lcr_pruned: selected {len(selected)}/{n_full} samples "
-            f"(ratio={self._prune_ratio:.2f}, noise_margin={self._judge_noise_margin})"
-        )
-
-        return self._filter_dataset(full_dataset, selected_set)
-
-    @staticmethod
-    def _filter_dataset(dataset_dict: DatasetDict, keep: set) -> DatasetDict:
-        """Keep only samples whose sequential position is in *keep*."""
-        result = {}
-        offset = 0
-        for subset_name, dataset in dataset_dict.items():
-            kept = []
-            for local_idx, sample in enumerate(dataset):
-                if offset + local_idx in keep:
-                    kept.append(sample)
-            result[subset_name] = MemoryDataset(
-                samples=kept,
-                name=dataset.name,
-                location=dataset.location if hasattr(dataset, "location") else None,
-            )
-            offset += len(list(dataset))
-        from evalscope.api.dataset import DatasetDict as DD
-        dd = DD()
-        dd.update(result)
-        return dd
+        self._init_pruning_params()

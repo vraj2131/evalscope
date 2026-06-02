@@ -2,10 +2,9 @@
 """
 LiveCodeBench — Discriminative-Diversity Pruned variant.
 
-Registers the benchmark name ``live_code_bench_pruned`` into evalscope's
-BENCHMARK_REGISTRY.  The adapter subclasses :class:`LiveCodeBenchAdapter`
-and overrides :meth:`load_dataset` to apply the discriminative-diversity
-pruner before returning samples to the evaluator.
+Registers ``live_code_bench_pruned`` into evalscope's BENCHMARK_REGISTRY.
+Pruning logic lives in :class:`PrunedAdapterMixin`; this file contains only
+the benchmark-specific configuration.
 
 Usage with evalscope CLI (after ``import evalscope_ext``):
 
@@ -23,36 +22,19 @@ Usage with evalscope CLI (after ``import evalscope_ext``):
       }'
 
 ``scores_dir`` must contain review JSONL files named
-``live_code_bench_v5__<model>.jsonl`` (standard evalscope output format).
-When ``scores_dir`` is omitted the adapter falls back to the full benchmark
-(no pruning), which is useful for generating the initial score files.
+``live_code_bench_v5__<model>.jsonl``.  When omitted the adapter falls back
+to the full benchmark (no pruning).
 """
 from __future__ import annotations
 
-import itertools
-from typing import Optional
-
-from evalscope.api.benchmark import BenchmarkMeta, DefaultDataAdapter
-from evalscope.api.dataset import DatasetDict, MemoryDataset
+from evalscope.api.benchmark import BenchmarkMeta
 from evalscope.api.registry import register_benchmark
 from evalscope.benchmarks.live_code_bench.live_code_bench_adapter import (
     LiveCodeBenchAdapter,
 )
 from evalscope.constants import Tags
-from evalscope.utils.logger import get_logger
 
-from evalscope_ext.pruner import (
-    load_scores_from_reviews,
-    select_pruned_samples,
-    validate_leave_one_out,
-)
-
-logger = get_logger()
-
-# Score key used by the LCB sandbox grader
-_SCORE_KEY = "pass"
-# Review file prefix (matches the shipped Evals file names)
-_BENCHMARK_PREFIX = "live_code_bench_v5"
+from evalscope_ext.benchmarks.base_pruned_adapter import PrunedAdapterMixin
 
 
 @register_benchmark(
@@ -81,10 +63,7 @@ _BENCHMARK_PREFIX = "live_code_bench_v5"
         extra_params={
             "pruning_strategy": {
                 "type": "str",
-                "description": (
-                    "Pruning strategy to use. Currently only "
-                    "'discriminative_diversity' is supported."
-                ),
+                "description": "Pruning strategy. Currently only 'discriminative_diversity' is supported.",
                 "value": "discriminative_diversity",
                 "choices": ["discriminative_diversity"],
             },
@@ -136,83 +115,12 @@ _BENCHMARK_PREFIX = "live_code_bench_v5"
         },
     )
 )
-class LCBPrunedAdapter(LiveCodeBenchAdapter):
+class LCBPrunedAdapter(PrunedAdapterMixin, LiveCodeBenchAdapter):
     """LiveCodeBench adapter with discriminative-diversity pruning."""
+
+    _SCORE_KEY = "pass"
+    _BENCHMARK_PREFIX = "live_code_bench_v5"
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self._pruning_strategy: str = self.extra_params.get(
-            "pruning_strategy", "discriminative_diversity"
-        )
-        self._prune_ratio: float = float(self.extra_params.get("prune_ratio", 0.3))
-        self._scores_dir: Optional[str] = self.extra_params.get("scores_dir")
-        self._n_buckets: int = int(self.extra_params.get("n_buckets", 5))
-        self._min_spearman: float = float(self.extra_params.get("min_spearman", 0.85))
-
-    def load_dataset(self) -> DatasetDict:
-        full_dataset = super().load_dataset()
-
-        if not self._scores_dir:
-            logger.warning(
-                "live_code_bench_pruned: no scores_dir provided — "
-                "returning full benchmark (no pruning)."
-            )
-            return full_dataset
-
-        logger.info(
-            f"live_code_bench_pruned: loading historical scores from {self._scores_dir}"
-        )
-        scores = load_scores_from_reviews(
-            reviews_dir=self._scores_dir,
-            score_key=_SCORE_KEY,
-            benchmark_prefix=_BENCHMARK_PREFIX,
-        )
-
-        selected = select_pruned_samples(
-            scores=scores,
-            prune_ratio=self._prune_ratio,
-            n_buckets=self._n_buckets,
-            judge_noise_margin=0.0,
-        )
-
-        # Leave-one-model-out validation
-        try:
-            rhos = validate_leave_one_out(
-                scores=scores,
-                selected_indices=selected,
-                min_spearman=self._min_spearman,
-            )
-            for model, rho in sorted(rhos.items()):
-                logger.info(f"  LOO Spearman ({model} held out): {rho:.3f}")
-        except ValueError as exc:
-            logger.warning(f"live_code_bench_pruned: {exc}")
-
-        selected_set = set(selected)
-        n_full = sum(len(list(ds)) for ds in full_dataset.values())
-        logger.info(
-            f"live_code_bench_pruned: selected {len(selected)}/{n_full} samples "
-            f"(ratio={self._prune_ratio:.2f})"
-        )
-
-        return self._filter_dataset(full_dataset, selected_set)
-
-    @staticmethod
-    def _filter_dataset(dataset_dict: DatasetDict, keep: set) -> DatasetDict:
-        """Keep only samples whose sequential position is in *keep*."""
-        result = {}
-        offset = 0
-        for subset_name, dataset in dataset_dict.items():
-            kept = []
-            for local_idx, sample in enumerate(dataset):
-                if offset + local_idx in keep:
-                    kept.append(sample)
-            result[subset_name] = MemoryDataset(
-                samples=kept,
-                name=dataset.name,
-                location=dataset.location if hasattr(dataset, "location") else None,
-            )
-            offset += len(list(dataset))
-        from evalscope.api.dataset import DatasetDict as DD
-        dd = DD()
-        dd.update(result)
-        return dd
+        self._init_pruning_params()
